@@ -91,27 +91,175 @@ theme_set(theme_dark_custom())
 focal_species  <- c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
 recent_days_30 <- 30
 recent_days_60 <- 60
+
+# ---- Data source settings ----
+# URLs/labels are built from pieces so copy/paste can't turn them into markdown links
+WA_HOST <- paste0("https", "://", "data", ".wa", ".gov")
+
+DATA_SOURCE_CHOICES <- setNames(
+  c("external", "internal"),
+  c(paste0("External data", ".wa", ".gov database"),
+    "Internal WDFW PostgreSQL database")
+)
+DEFAULT_DATA_SOURCE <- "external"
+source_label <- function(src) names(DATA_SOURCE_CHOICES)[match(src, DATA_SOURCE_CHOICES)]
+
+# Internal database views
+INTERNAL_VIEWS <- c(
+  catch       = "vw_analysis_catch",
+  interview   = "vw_analysis_interview",
+  effort      = "vw_analysis_effort_count",
+  creel_event = "vw_creel_event"
+)
+
+# Public data.wa.gov mirrors (same Socrata datasets used by creelutils::fetch_data())
+SOCRATA_ENDPOINTS <- c(
+  catch       = paste0(WA_HOST, "/resource/", "6y4e-8ftk", ".csv"),
+  interview   = paste0(WA_HOST, "/resource/", "rpax-ahqm", ".csv"),
+  effort      = paste0(WA_HOST, "/resource/", "h9a6-g38s", ".csv"),
+  creel_event = paste0(WA_HOST, "/resource/", "ui95-axtn", ".csv")
+)
+
+# Columns kept as text when reading CSVs (protects leading zeros in IDs / CWT / snout codes)
+PROTECTED_CHAR_COLS <- c(
+  "creel_event_id", "interview_id", "catch_id", "effort_event_id", "location_id",
+  "snout_code", "cwt_code", "scale_card_num", "scale_card_pos", "crc_area",
+  "image_url", "comments", "comment_txt", "comments_txt"
+)
+
+# Fishing time info-check thresholds
+MIN_FISH_MINUTES <- 30   # interview / fishing end less than this many minutes after start
+MAX_FISH_HOURS   <- 12   # fishing time longer than this many hours
 ```
 
 ```{r database-connection, include=FALSE}
-con <- connect_creel_db()
+# The internal connection is opened lazily, only when "Internal" is selected
+db <- new.env(parent = emptyenv())
+db$con <- NULL
 
-shiny::onStop(function() try(DBI::dbDisconnect(con), silent = TRUE))
+get_con <- function() {
+  ok <- !is.null(db$con) &&
+    isTRUE(tryCatch(DBI::dbIsValid(db$con), error = function(e) FALSE))
+  if (!ok) db$con <- connect_creel_db()
+  db$con
+}
 
-available_fisheries <- tryCatch({
-  lut <- fishery_lut(conn = con)
-  if ("year" %in% names(lut)) lut <- dplyr::arrange(lut, dplyr::desc(year), fishery_name)
-  unique(as.character(lut$fishery_name))
-}, error = function(e) {
-  creelutils::fetch_fishery_names()
+shiny::onStop(function() {
+  if (!is.null(db$con)) try(DBI::dbDisconnect(db$con), silent = TRUE)
 })
-available_fisheries <- available_fisheries[!is.na(available_fisheries) & nzchar(available_fisheries)]
 
+clean_fishery_names <- function(x) {
+  x <- unique(as.character(x))
+  x[!is.na(x) & nzchar(x)]
+}
+
+# Newest year first, then alphabetical (used for the external list)
+sort_fisheries <- function(x) {
+  yr <- suppressWarnings(as.integer(str_extract(x, "\\d{4}")))
+  x[order(-coalesce(yr, 0L), x)]
+}
+
+load_fishery_names <- function(source = c("external", "internal")) {
+  source <- match.arg(source)
+  if (source == "internal") {
+    lut <- fishery_lut(conn = get_con())
+    if ("year" %in% names(lut)) lut <- dplyr::arrange(lut, dplyr::desc(year), fishery_name)
+    clean_fishery_names(lut$fishery_name)
+  } else {
+    sort_fisheries(clean_fishery_names(creelutils::fetch_fishery_names()))
+  }
+}
+
+available_fisheries <- tryCatch(
+  load_fishery_names(DEFAULT_DATA_SOURCE),
+  error = function(e) {
+    message("Could not load fishery names: ", conditionMessage(e))
+    character(0)
+  }
+)
+
+# Filter string for fetch_db_table() (internal)
 q_in <- function(col, x) {
   x <- unique(as.character(x))
   x <- x[!is.na(x) & nzchar(x)]
   if (!length(x)) return("FALSE")
   sprintf("%s %%in%% c(%s)", col, paste(encodeString(x, quote = '"'), collapse = ", "))
+}
+
+# Filter string for Socrata $where (external)
+soql_in <- function(col, x) {
+  x <- unique(as.character(x))
+  x <- x[!is.na(x) & nzchar(x)]
+  if (!length(x)) return(sprintf("%s = '__no_match__'", col))
+  sprintf("%s in(%s)", col,
+          paste0("'", gsub("'", "''", x, fixed = TRUE), "'", collapse = ", "))
+}
+
+# Paged download from a data.wa.gov endpoint; everything read as text first
+socrata_get <- function(url, where, limit = 50000L) {
+  url   <- clean_url(url)   # strips any [url](url) formatting
+  token <- Sys.getenv("SOCRATA_APP_TOKEN", unset = "")
+  hdr   <- if (nzchar(token)) httr::add_headers(`X-App-Token` = token) else NULL
+  offset <- 0L
+  pages  <- list()
+  repeat {
+    resp <- httr::GET(
+      url, hdr, httr::timeout(180),
+      query = list(`$where` = where, `$limit` = limit,
+                   `$offset` = offset, `$order` = ":id")
+    )
+    if (httr::status_code(resp) == 429) {
+      stop("data.wa.gov throttled the request (HTTP 429). Add SOCRATA_APP_TOKEN ",
+           "to .Renviron (see ?creelutils::fetch_data) and restart R.", call. = FALSE)
+    }
+    httr::stop_for_status(resp, task = paste("download", basename(url)))
+    txt  <- httr::content(resp, as = "text", encoding = "UTF-8")
+    page <- readr::read_csv(I(txt),
+                            col_types = readr::cols(.default = readr::col_character()),
+                            na = c("", "NA"), show_col_types = FALSE)
+    pages <- c(pages, list(page))
+    if (nrow(page) < limit) break
+    offset <- offset + limit
+  }
+  dplyr::bind_rows(pages)
+}
+
+# Guess types for external data, but keep ID / code columns as text
+type_external <- function(df) {
+  protect <- intersect(PROTECTED_CHAR_COLS, names(df))
+  spec <- do.call(
+    readr::cols,
+    c(list(.default = readr::col_guess()),
+      setNames(rep(list(readr::col_character()), length(protect)), protect))
+  )
+  readr::type_convert(df, col_types = spec)
+}
+
+# One fetch function for both sources
+fetch_component <- function(source, component, col, values) {
+  values <- unique(as.character(values))
+  values <- values[!is.na(values) & nzchar(values)]
+  if (source == "internal") {
+    con <- get_con()
+    if (!length(values)) {
+      return(fetch_db_table(con, "creel", INTERNAL_VIEWS[[component]], filter = "FALSE"))
+    }
+    split(values, ceiling(seq_along(values) / 1000)) %>%
+      map(~fetch_db_table(con, "creel", INTERNAL_VIEWS[[component]],
+                          filter = q_in(col, .x))) %>%
+      bind_rows()
+  } else {
+    url <- SOCRATA_ENDPOINTS[[component]]
+    raw <- if (!length(values)) {
+      socrata_get(url, soql_in(col, character(0)))
+    } else {
+      # Small chunks keep the URL short (creel_event_id values are long GUIDs)
+      split(values, ceiling(seq_along(values) / 100)) %>%
+        map(~socrata_get(url, soql_in(col, .x))) %>%
+        bind_rows()
+    }
+    type_external(raw)
+  }
 }
 
 prev_fishery_name <- function(x) {
@@ -128,7 +276,8 @@ prev_fishery_name <- function(x) {
 ```
 
 ```{r data-wrangling, include=FALSE}
-# Only *_date and *_time columns are converted; qaqc_datetime is left untouched
+# Only *_date and *_time columns are converted; qaqc_datetime is left untouched.
+# Handles database types and data.wa.gov text ("2025-09-01T00:00:00.000", "14:15:00").
 process_datetime <- function(df) {
   to_date <- function(x) {
     if (inherits(x, "Date")) {
@@ -136,38 +285,62 @@ process_datetime <- function(df) {
     } else if (inherits(x, "POSIXt")) {
       as.Date(x)
     } else {
-      ymd(as.character(x))
+      suppressWarnings(ymd(substr(as.character(x), 1, 10)))
     }
+  }
+  to_time <- function(x) {
+    if (inherits(x, "hms")) return(x)
+    if (inherits(x, "difftime")) return(as_hms(x))
+    if (inherits(x, "POSIXt")) return(as_hms(format(x, "%H:%M:%S")))
+    x <- trimws(as.character(x))
+    x[!is.na(x) & !nzchar(x)] <- NA_character_
+    x <- sub("^.*[T ]", "", x)
+    x <- substr(x, 1, 8)
+    x <- if_else(!is.na(x) & nchar(x) == 5, paste0(x, ":00"), x)
+    as_hms(x)
   }
 
   df %>%
     mutate(
       across(matches("_date$"), to_date),
-      across(matches("_time$"), as_hms)
+      across(matches("_time$"), to_time)
     )
 }
 
 # Make sure optional columns exist (as NA text) so select() never fails
 ensure_cols <- function(df, cols) {
-  for (nm in cols) if (!nm %in% names(df)) df[[nm]] <- NA_character_
+  for (nm in cols) if (!nm %in% names(df)) df[[nm]] <- rep(NA_character_, nrow(df))
   df
 }
 
+# TRUE/FALSE text from CSVs -> logical (leaves real logicals alone)
+as_flag <- function(x) {
+  if (is.logical(x)) return(x)
+  v <- tolower(trimws(as.character(x)))
+  case_when(v %in% c("true", "t", "1", "yes") ~ TRUE,
+            v %in% c("false", "f", "0", "no") ~ FALSE,
+            TRUE ~ NA)
+}
+
+catch_cols <- c(
+  "event_date", "water_body", "fishery_name", "project_name",
+  "species", "run", "sex", "fate", "fork_length_cm", "fish_count",
+  "life_stage", "fish_processing_status", "fin_mark", "cwt_detection_status",
+  "snout_code", "cwt_read_status", "cwt_code", "cwt_species", "cwt_run",
+  "scale_card_num", "scale_card_pos", "scale_age_code",
+  "pit_detection_status", "comments", "image_url",
+  "creel_event_id", "interview_id", "catch_id"
+)
+
 wrangle_catch <- function(df) {
   df %>%
-    ensure_cols(c("comments", "image_url")) %>%
-    select(
-      event_date, water_body, fishery_name, project_name,
-      species, run, sex, fate, fork_length_cm, fish_count,
-      life_stage, fish_processing_status, fin_mark, cwt_detection_status,
-      snout_code, cwt_read_status, cwt_code, cwt_species, cwt_run,
-      scale_card_num, scale_card_pos, scale_age_code,
-      pit_detection_status, comments, image_url,
-      creel_event_id, interview_id, catch_id
-    ) %>%
+    ensure_cols(catch_cols) %>%
+    select(all_of(catch_cols)) %>%
     mutate(
       fish_count     = as.numeric(fish_count),
       fork_length_cm = as.numeric(fork_length_cm),
+      across(c(snout_code, cwt_code, scale_card_num, scale_card_pos,
+               creel_event_id, interview_id, catch_id), as.character),
       # Stray spaces (e.g. "Kept ") would make exact matches fail
       species        = trimws(as.character(species)),
       fate           = trimws(as.character(fate))
@@ -175,46 +348,61 @@ wrangle_catch <- function(df) {
     process_datetime()
 }
 
-# Accepts either comment_txt or comments_txt; exposes it as comment_txt
+# Internal view uses water_body_desc; data.wa.gov uses water_body.
+# Accepts comment_txt or comments_txt; exposes it as comment_txt
 wrangle_creel_event <- function(df) {
-  df <- df %>% rename(water_body = water_body_desc)
+  if ("water_body_desc" %in% names(df) && !"water_body" %in% names(df)) {
+    df <- df %>% rename(water_body = water_body_desc)
+  }
   if (!"comment_txt" %in% names(df)) {
-    df$comment_txt <- if ("comments_txt" %in% names(df)) df$comments_txt else NA_character_
+    df$comment_txt <- if ("comments_txt" %in% names(df)) df$comments_txt else rep(NA_character_, nrow(df))
   }
   df %>%
+    ensure_cols(c("event_date", "water_body", "project_name", "start_time", "end_time",
+                  "tie_in_indicator", "qaqc_datetime", "creel_event_id")) %>%
     select(
       event_date, water_body, project_name, start_time, end_time,
       tie_in_indicator, comment_txt, qaqc_datetime, creel_event_id
     ) %>%
-    mutate(tie_in_indicator = as.numeric(tie_in_indicator)) %>%
+    mutate(tie_in_indicator = as.numeric(as_flag(tie_in_indicator)),
+           creel_event_id   = as.character(creel_event_id)) %>%
     process_datetime()
 }
+
+interview_cols <- c(
+  "event_date", "project_name", "fishery_name", "water_body", "crc_area", "fishing_location",
+  "section_num", "survey_type", "surveyor_num", "interview_number", "trip_status",
+  "previously_interviewed", "angler_count", "total_group_count", "vehicle_count",
+  "trailer_count", "boat_type", "boat_used", "fishing_start_time", "fishing_end_time",
+  "interview_time", "comment_txt", "creel_event_id", "interview_id", "location_id"
+)
 
 wrangle_interview <- function(df) {
   df %>%
-    ensure_cols("comment_txt") %>%
-    select(
-      event_date, project_name, fishery_name, water_body, crc_area, fishing_location,
-      section_num, survey_type, surveyor_num, interview_number, trip_status,
-      previously_interviewed, angler_count, total_group_count, vehicle_count,
-      trailer_count, boat_type, boat_used, fishing_start_time, fishing_end_time,
-      interview_time, comment_txt, creel_event_id, interview_id, location_id
-    ) %>%
+    ensure_cols(interview_cols) %>%
+    select(all_of(interview_cols)) %>%
     mutate(across(c(interview_number, total_group_count, vehicle_count,
-                    trailer_count, angler_count), as.numeric)) %>%
+                    trailer_count, angler_count), as.numeric),
+           across(c(creel_event_id, interview_id, location_id), as.character)) %>%
     process_datetime()
 }
 
+effort_cols <- c(
+  "event_date", "project_name", "fishery_name", "water_body", "location",
+  "tie_in_indicator", "survey_type", "count_sequence", "section_num",
+  "effort_start_time", "effort_end_time", "count_quantity", "count_type",
+  "location_type", "surveyor_num", "comments", "p_census_boat", "p_census_bank",
+  "indirect_census_bank", "no_count_reason", "creel_event_id", "effort_event_id",
+  "location_id"
+)
+
 wrangle_effort <- function(df) {
   df %>%
-    select(
-      event_date, project_name, fishery_name, water_body, location,
-      tie_in_indicator, survey_type, count_sequence, section_num,
-      effort_start_time, effort_end_time, count_quantity, count_type,
-      location_type, surveyor_num, comments, p_census_boat, p_census_bank,
-      indirect_census_bank, no_count_reason, creel_event_id, effort_event_id,
-      location_id
-    ) %>%
+    ensure_cols(effort_cols) %>%
+    select(all_of(effort_cols)) %>%
+    mutate(tie_in_indicator = as_flag(tie_in_indicator),
+           count_sequence   = as.numeric(count_sequence),
+           across(c(creel_event_id, effort_event_id, location_id), as.character)) %>%
     arrange(event_date, fishery_name, water_body, location,
             tie_in_indicator, count_sequence, section_num, effort_start_time) %>%
     mutate(across(c(count_quantity, p_census_boat, p_census_bank,
@@ -222,10 +410,37 @@ wrangle_effort <- function(df) {
     process_datetime()
 }
 
-sel_fisheries <- reactiveVal(NULL)
+# ---- Data source state ----
+fisheries_rv  <- reactiveVal(available_fisheries)   # fishery list for the active source
+active_source <- reactiveVal(DEFAULT_DATA_SOURCE)   # source shown in the picker
+sel_fisheries <- reactiveVal(NULL)                  # fisheries loaded with "Load data"
+sel_source    <- reactiveVal(DEFAULT_DATA_SOURCE)   # source used for the loaded data
+
+# Switching source reloads the fishery list; a failed internal connection reverts to External
+observeEvent(input$data_source, {
+  src <- input$data_source
+  if (identical(src, active_source()) && length(fisheries_rv())) return()
+  nm <- withProgress(
+    message = paste("Loading fishery list:", source_label(src)), value = 0.4,
+    tryCatch(load_fishery_names(src), error = function(e) e)
+  )
+  if (inherits(nm, "error")) {
+    showNotification(
+      paste0("Could not connect to ", source_label(src), ": ", conditionMessage(nm),
+             if (src == "internal") " Reverting to External." else ""),
+      type = "error", duration = 15)
+    if (src == "internal") updateRadioButtons(inputId = "data_source", selected = "external")
+    return()
+  }
+  active_source(src)
+  fisheries_rv(nm)
+  updateSelectizeInput(inputId = "fishery_pick", choices = nm,
+                       selected = intersect(isolate(input$fishery_pick), nm))
+}, ignoreInit = TRUE)
 
 observeEvent(input$fishery_go, {
   req(input$fishery_pick)
+  sel_source(active_source())
   sel_fisheries(input$fishery_pick)
 }, ignoreInit = TRUE)
 
@@ -250,37 +465,36 @@ observeEvent(input$open_photo, {
 }, ignoreInit = TRUE)
 
 dat <- reactive({
-  fs <- req(sel_fisheries())
-  withProgress(message = "Querying selected fisheries...", value = 0.1, {
-    flt <- q_in("fishery_name", fs)
+  fs  <- req(sel_fisheries())
+  src <- sel_source()
+  out <- withProgress(message = paste("Querying", source_label(src), "..."), value = 0.1, {
+    tryCatch({
+      catch     <- fetch_component(src, "catch", "fishery_name", fs)
+      incProgress(0.25)
+      interview <- fetch_component(src, "interview", "fishery_name", fs)
+      incProgress(0.25)
+      effort    <- fetch_component(src, "effort", "fishery_name", fs)
+      incProgress(0.2)
 
-    catch     <- fetch_db_table(con, "creel", "vw_analysis_catch", filter = flt)
-    incProgress(0.25)
-    interview <- fetch_db_table(con, "creel", "vw_analysis_interview", filter = flt)
-    incProgress(0.25)
-    effort    <- fetch_db_table(con, "creel", "vw_analysis_effort_count", filter = flt)
-    incProgress(0.2)
+      ids <- unique(na.omit(as.character(c(
+        catch$creel_event_id, effort$creel_event_id, interview$creel_event_id
+      ))))
 
-    ids <- unique(na.omit(as.character(c(
-      catch$creel_event_id, effort$creel_event_id, interview$creel_event_id
-    ))))
+      creel_event <- fetch_component(src, "creel_event", "creel_event_id", ids)
 
-    creel_event <- if (length(ids)) {
-      split(ids, ceiling(seq_along(ids) / 1000)) %>%
-        map(~fetch_db_table(con, "creel", "vw_creel_event",
-                            filter = q_in("creel_event_id", .x))) %>%
-        bind_rows()
-    } else {
-      fetch_db_table(con, "creel", "vw_creel_event", filter = "FALSE")
-    }
-
-    list(
-      catch       = wrangle_catch(catch),
-      interview   = wrangle_interview(interview),
-      effort      = wrangle_effort(effort),
-      creel_event = wrangle_creel_event(creel_event)
-    )
+      list(
+        catch       = wrangle_catch(catch),
+        interview   = wrangle_interview(interview),
+        effort      = wrangle_effort(effort),
+        creel_event = wrangle_creel_event(creel_event)
+      )
+    }, error = function(e) {
+      showNotification(paste0("Data load failed (", source_label(src), "): ",
+                              conditionMessage(e)), type = "error", duration = 20)
+      NULL
+    })
   })
+  req(out)
 })
 
 wdfw_catch        <- reactive(dat()$catch)
@@ -291,14 +505,16 @@ wdfw_creel_event  <- reactive(dat()$creel_event)
 prev_map <- reactive({
   tibble(fishery_name = req(sel_fisheries())) %>%
     mutate(prev_name = prev_fishery_name(fishery_name),
-           prev_name = if_else(prev_name %in% available_fisheries, prev_name, NA_character_))
+           prev_name = if_else(prev_name %in% fisheries_rv(), prev_name, NA_character_))
 })
 
 prev_catch <- reactive({
   pn <- na.omit(prev_map()$prev_name)
   if (!length(pn)) return(NULL)
-  wrangle_catch(fetch_db_table(con, "creel", "vw_analysis_catch",
-                               filter = q_in("fishery_name", pn)))
+  tryCatch(
+    wrangle_catch(fetch_component(sel_source(), "catch", "fishery_name", pn)),
+    error = function(e) NULL
+  )
 })
 ```
 
@@ -556,6 +772,74 @@ qa_int_9 <- reactive({
            interview_number, fishing_location, creel_event_id, qc_9_interview)
 })
 
+# ---- Fishing time checks ----
+# Times are hms (24-hour), so subtraction gives seconds. Calculated once, used by 3 checks.
+int_time_metrics <- reactive({
+  wdfw_interview() %>%
+    filter(!is.na(fishing_start_time)) %>%
+    mutate(
+      start_s     = as.numeric(fishing_start_time),
+      secs_to_end = as.numeric(fishing_end_time) - start_s,
+      secs_to_int = as.numeric(interview_time)   - start_s,
+      secs_fished = coalesce(secs_to_end, secs_to_int),
+      fishing_duration_source = case_when(
+        !is.na(secs_to_end) ~ "Fishing end time",
+        !is.na(secs_to_int) ~ "Interview time",
+        TRUE ~ NA_character_),
+      fish_minutes_to_end       = round(secs_to_end / 60, 1),
+      fish_minutes_to_interview = round(secs_to_int / 60, 1),
+      fishing_hours             = round(secs_fished / 3600, 2)
+    )
+})
+
+# Start Time = Interview/ End Time (review, red/green): exact matches only
+qa_int_start_eq <- reactive({
+  int_time_metrics() %>%
+    mutate(eq_end = !is.na(secs_to_end) & secs_to_end == 0,
+           eq_int = !is.na(secs_to_int) & secs_to_int == 0) %>%
+    filter(eq_end | eq_int) %>%
+    mutate(start_time_error = case_when(
+      eq_end & eq_int ~ "Start time = fishing end time = interview time",
+      eq_end          ~ "Start time = fishing end time",
+      TRUE            ~ "Start time = interview time")) %>%
+    select(start_time_error, event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, creel_event_id, interview_id)
+})
+
+# Fishing end / interview < 30 min after start (info, blue).
+# Exact matches (0 min) are left to the review check; times before start are kept.
+qa_int_short <- reactive({
+  int_time_metrics() %>%
+    mutate(
+      e_end_short = !is.na(secs_to_end) & secs_to_end != 0 & secs_to_end < MIN_FISH_MINUTES * 60,
+      e_int_short = !is.na(secs_to_int) & secs_to_int != 0 & secs_to_int < MIN_FISH_MINUTES * 60
+    ) %>%
+    filter(e_end_short | e_int_short) %>%
+    mutate(short_time_alert = sub("; $", "", paste0(
+      if_else(e_end_short,
+              if_else(secs_to_end < 0, "Fishing end time before start; ",
+                      paste0("Fishing end < ", MIN_FISH_MINUTES, " min after start; ")), ""),
+      if_else(e_int_short,
+              if_else(secs_to_int < 0, "Interview time before start; ",
+                      paste0("Interview < ", MIN_FISH_MINUTES, " min after start; ")), "")))) %>%
+    select(short_time_alert, event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, fish_minutes_to_end, fish_minutes_to_interview,
+           creel_event_id, interview_id)
+})
+
+# Fishing time > 12 hours (info, blue). Uses end time, or interview time if no end time.
+qa_int_long <- reactive({
+  int_time_metrics() %>%
+    filter(!is.na(secs_fished), secs_fished > MAX_FISH_HOURS * 3600) %>%
+    mutate(long_time_alert = paste0("Fishing time > ", MAX_FISH_HOURS, " hours")) %>%
+    select(long_time_alert, event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, fishing_duration_source, fishing_hours,
+           creel_event_id, interview_id)
+})
+
 # Interview comments (info)
 qa_com_int <- reactive({
   wdfw_interview() %>%
@@ -601,7 +885,7 @@ qa_eff_veh15 <- reactive({
            creel_event_id, effort_event_id)
 })
 
-# More trailers than vehicles within an effort_event_id (info)
+# More trailers than vehicles within an effort_event_id (review)
 qa_eff_trl <- reactive({
   wdfw_effort_count() %>%
     filter(count_type %in% effort_types, !is.na(effort_event_id)) %>%
@@ -675,8 +959,10 @@ qa_checks <- list(
   list(group = "Interview",   type = "review", name = "Angler count > group count",            page = "qa-int-6",        data = qa_int_6),
   list(group = "Interview",   type = "review", name = "Vehicle count > group count",           page = "qa-int-7",        data = qa_int_7),
   list(group = "Interview",   type = "review", name = "NA fishing location",                   page = "qa-int-9",        data = qa_int_9),
+  list(group = "Interview",   type = "review", name = "Start Time = Interview/ End Time",      page = "qa-int-start-eq", data = qa_int_start_eq),
   list(group = "Effort",      type = "review", name = "Effort count sequence",                 page = "qa-eff-1",        data = qa_eff_1),
   list(group = "Effort",      type = "review", name = "Effort start time > end time",          page = "qa-eff-2",        data = qa_eff_2),
+  list(group = "Effort",      type = "review", name = "More trailers than vehicles",           page = "qa-eff-trl",      data = qa_eff_trl),
   list(group = "Creel event", type = "review", name = "Needs proof stamp",                     page = "qa-ce-proof",     data = qa_ce_proof),
   list(group = "Creel event", type = "review", name = "NA survey end time",                    page = "qa-ce-end",       data = qa_ce_end),
   list(group = "Info",        type = "info",   name = "All CWT + (Beep)",                      page = "qa-cwt-beep",     data = qa_cwt_beep),
@@ -684,9 +970,10 @@ qa_checks <- list(
   list(group = "Catch",       type = "info",   name = "Catch > 10",                            page = "qa-catch-gt10",   data = qa_catch_gt10),
   list(group = "Catch",       type = "info",   name = "Photos",                                page = "qa-photos",       data = qa_photos),
   list(group = "Catch",       type = "info",   name = "Comments",                              page = "qa-com-catch",    data = qa_com_catch),
+  list(group = "Interview",   type = "info",   name = "Fishing end / interview < 30 min after start", page = "qa-int-short", data = qa_int_short),
+  list(group = "Interview",   type = "info",   name = "Fishing time > 12 hrs",                 page = "qa-int-long",     data = qa_int_long),
   list(group = "Interview",   type = "info",   name = "Comments",                              page = "qa-com-int",      data = qa_com_int),
   list(group = "Effort",      type = "info",   name = "Vehicles >15",                          page = "qa-eff-veh15",    data = qa_eff_veh15),
-  list(group = "Effort",      type = "info",   name = "More trailers than vehicles",           page = "qa-eff-trl",      data = qa_eff_trl),
   list(group = "Effort",      type = "info",   name = "Comments",                              page = "qa-com-eff",      data = qa_com_eff),
   list(group = "Creel event", type = "info",   name = "Comments",                              page = "qa-com-ce",       data = qa_com_ce)
 )
@@ -888,6 +1175,13 @@ dark_reactable_theme <- reactableTheme(
 # Sidebar {.sidebar}
 
 ```{r sidebar-controls, echo=FALSE}
+# Data source selector (External is the default)
+radioButtons(
+  "data_source", "Data source",
+  choices  = DATA_SOURCE_CHOICES,
+  selected = DEFAULT_DATA_SOURCE
+)
+
 # Button sits above the picker so the open drop-down never covers it
 div(style = "margin-bottom: 12px;",
     actionButton("fishery_go", "Load data", class = "btn-primary",
@@ -899,6 +1193,12 @@ selectizeInput(
   options = list(placeholder = "Type to search...",
                  plugins = list("remove_button"))
 )
+
+renderUI({
+  req(sel_fisheries())
+  div(style = "font-size: 12px; color: #bbbbbb; margin-top: 6px;",
+      paste0("Loaded from: ", source_label(sel_source())))
+})
 
 tags$style(HTML("
 .dataTables_wrapper .dataTables_paginate .paginate_button,
@@ -1251,6 +1551,24 @@ renderDT(dt_dark(qa_int_8()))
 renderDT(dt_dark(qa_int_9()))
 ```
 
+# Start Time = Interview/ End Time {#qa-int-start-eq data-navmenu="Interviews QA_QC"}
+
+```{r interview-start-eq, echo=FALSE}
+renderDT(dt_dark(qa_int_start_eq()))
+```
+
+# Fishing End / Interview < 30 Min After Start {#qa-int-short data-navmenu="Interviews QA_QC"}
+
+```{r interview-time-short, echo=FALSE}
+renderDT(dt_dark(qa_int_short()))
+```
+
+# Fishing Time > 12 Hrs {#qa-int-long data-navmenu="Interviews QA_QC"}
+
+```{r interview-time-long, echo=FALSE}
+renderDT(dt_dark(qa_int_long()))
+```
+
 # Interview Comments {#qa-com-int data-navmenu="Interviews QA_QC"}
 
 ```{r interview-comments, echo=FALSE}
@@ -1285,130 +1603,3 @@ renderDT(dt_dark(qa_eff_trl()))
 
 ```{r effort-comments, echo=FALSE}
 renderDT(dt_dark(qa_com_eff()))
-```
-
-# Needs Proof Stamp {#qa-ce-proof data-navmenu="Creel Event QA_QC"}
-
-```{r proof-stamp, echo=FALSE}
-renderDT(dt_dark(qa_ce_proof()))
-```
-
-# NA Survey End Time {#qa-ce-end data-navmenu="Creel Event QA_QC"}
-
-```{r na-survey-end, echo=FALSE}
-renderDT(dt_dark(qa_ce_end()))
-```
-
-# Creel Event Comments {#qa-com-ce data-navmenu="Creel Event QA_QC"}
-
-```{r creel-event-comments, echo=FALSE}
-renderDT(dt_dark(qa_com_ce()))
-```
-
-# Catch Table {data-navmenu="Summary"}
-
-```{r catch-summary, echo=FALSE}
-catch_group_table <- function(df, fn) {
-  d <- df %>%
-    filter(fishery_name == fn) %>%
-    mutate(
-      across(c(species, life_stage, fin_mark, fate), ~na_if(as.character(.x), "")),
-      across(c(species, life_stage, fin_mark, fate), ~replace_na(.x, "Not recorded")),
-      cwt_detection_status = replace_na(na_if(as.character(cwt_detection_status), ""),
-                                        "Not recorded")
-    )
-
-  cwt <- d %>%
-    group_by(species, life_stage, fin_mark, fate, cwt_detection_status) %>%
-    summarise(fish = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
-    mutate(catch_group = paste(species, life_stage, fin_mark, fate, sep = "_"))
-
-  grp <- cwt %>%
-    group_by(catch_group) %>%
-    summarise(
-      total_fish   = sum(fish),
-      n_cwt_status = n(),
-      cwt_status   = if (n() == 1) first(cwt_detection_status)
-                     else paste0(n(), " statuses (click row to expand)"),
-      .groups = "drop"
-    ) %>%
-    arrange(catch_group)
-
-  reactable(
-    grp,
-    filterable = TRUE,
-    outlined = TRUE, highlight = TRUE, resizable = TRUE,
-    defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
-    columns = list(
-      catch_group  = colDef(name = "Catch groups", minWidth = 220),
-      total_fish   = colDef(name = "Total fish", format = colFormat(separators = TRUE)),
-      cwt_status   = colDef(name = "CWT detection status"),
-      n_cwt_status = colDef(show = FALSE)
-    ),
-    details = function(index) {
-      if (grp$n_cwt_status[index] < 2) return(NULL)
-      sub <- cwt %>%
-        filter(catch_group == grp$catch_group[index]) %>%
-        select(`CWT detection status` = cwt_detection_status, Fish = fish) %>%
-        arrange(desc(Fish))
-      div(style = "padding: 8px 24px;",
-          reactable(sub, defaultPageSize = 50, outlined = TRUE, compact = TRUE,
-                    theme = dark_reactable_theme))
-    },
-    theme = dark_reactable_theme
-  )
-}
-
-renderUI(selectInput("catch_tbl_fishery", "Fishery:", choices = req(sel_fisheries())))
-renderReactable(catch_group_table(wdfw_catch(), req(input$catch_tbl_fishery)))
-```
-
-# Effort Table {data-navmenu="Summary"}
-
-```{r effort-summary, echo=FALSE}
-renderReactable({
-  wdfw_effort_count() %>%
-    group_by(fishery_name, water_body, location, survey_type, count_type) %>%
-    summarise(
-      total_vehicles_trailers_from_effort_counts = sum(count_quantity, na.rm = TRUE),
-      .groups = 'drop'
-    ) %>%
-    reactable(
-      filterable = TRUE,
-      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
-      groupBy = c("fishery_name", "survey_type", "water_body", "location"),
-      columns = list(
-        total_vehicles_trailers_from_effort_counts = colDef(
-          aggregate = "sum", format = colFormat(separators = TRUE)
-        )
-      ),
-      outlined = TRUE, highlight = TRUE, resizable = TRUE,
-      theme = dark_reactable_theme
-    )
-})
-```
-
-# Interview Table {data-navmenu="Summary"}
-
-```{r interview-summary, echo=FALSE}
-renderReactable({
-  wdfw_interview() %>%
-    group_by(fishery_name, water_body, fishing_location, boat_used, boat_type) %>%
-    summarise(
-      total_angler_count_from_interviews = sum(angler_count, na.rm = TRUE),
-      .groups = 'drop'
-    ) %>%
-    reactable(
-      filterable = TRUE,
-      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
-      groupBy = c("fishery_name", "water_body", "fishing_location", "boat_used"),
-      columns = list(
-        total_angler_count_from_interviews = colDef(
-          aggregate = "sum", format = colFormat(separators = TRUE)
-        )
-      ),
-      outlined = TRUE, highlight = TRUE, resizable = TRUE,
-      theme = dark_reactable_theme
-    )
-})
-```
