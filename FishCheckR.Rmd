@@ -650,11 +650,21 @@ qa_scale_card <- reactive({
     mutate(scale_card_error = "Position with no card #",
            species_on_card = NA_character_, positions_on_card = NA_character_)
 
-  bind_rows(bad_cards, orphans) %>%
-    arrange(card, pos) %>%
-    select(scale_card_error, scale_card_num, scale_card_pos, species,
+  out <- bind_rows(bad_cards, orphans)
+
+  # Newest first, but keep each card's rows together (card sorted by its latest date)
+  card_latest <- out %>%
+    filter(!is.na(card)) %>%
+    group_by(card) %>%
+    summarise(card_latest = max(event_date, na.rm = TRUE), .groups = "drop")
+
+  out %>%
+    left_join(card_latest, by = "card") %>%
+    mutate(sort_date = coalesce(card_latest, event_date)) %>%
+    arrange(desc(sort_date), card, pos) %>%
+    select(scale_card_error, event_date, scale_card_num, scale_card_pos, species,
            species_on_card, positions_on_card,
-           event_date, project_name, fishery_name, water_body,
+           project_name, fishery_name, water_body,
            creel_event_id, interview_id, catch_id)
 })
 
@@ -943,6 +953,45 @@ qa_com_ce <- reactive({
            comment_txt, creel_event_id)
 })
 
+# ---- Late Night Times (review, red/green): 22:00 through 04:00, inclusive ----
+is_late_night <- function(x) {
+  s <- as.numeric(x)
+  !is.na(s) & (s >= 22 * 3600 | s < 4 * 3600)
+}
+
+# Adds late_night_error listing which columns were late; keeps flagged rows only
+flag_late <- function(df, cols, labels = cols) {
+  flags <- Map(function(cl, lb) if_else(is_late_night(df[[cl]]), paste0(lb, "; "), ""),
+               cols, labels)
+  df$late_night_error <- sub("; $", "", do.call(paste0, unname(flags)))
+  df[nzchar(df$late_night_error), , drop = FALSE]
+}
+
+qa_int_late <- reactive({
+  wdfw_interview() %>%
+    flag_late(c("fishing_start_time", "fishing_end_time", "interview_time"),
+              c("Fishing start", "Fishing end", "Interview time")) %>%
+    select(late_night_error, event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, creel_event_id, interview_id)
+})
+
+qa_eff_late <- reactive({
+  wdfw_effort_count() %>%
+    flag_late(c("effort_start_time", "effort_end_time"),
+              c("Effort start", "Effort end")) %>%
+    select(late_night_error, event_date, project_name, fishery_name, water_body,
+           location, survey_type, count_sequence, count_type,
+           effort_start_time, effort_end_time, creel_event_id, effort_event_id)
+})
+
+qa_ce_late <- reactive({
+  wdfw_creel_event() %>%
+    flag_late(c("start_time", "end_time"), c("Survey start", "Survey end")) %>%
+    select(late_night_error, event_date, project_name, water_body,
+           start_time, end_time, comment_txt, creel_event_id)
+})
+
 # ---- Registry used by the summary page (page = the {#id} on each page header) ----
 # type = "review" (red/green) or "info" (blue, not counted as needing review)
 qa_checks <- list(
@@ -975,7 +1024,10 @@ qa_checks <- list(
   list(group = "Interview",   type = "info",   name = "Comments",                              page = "qa-com-int",      data = qa_com_int),
   list(group = "Effort",      type = "info",   name = "Vehicles >15",                          page = "qa-eff-veh15",    data = qa_eff_veh15),
   list(group = "Effort",      type = "info",   name = "Comments",                              page = "qa-com-eff",      data = qa_com_eff),
-  list(group = "Creel event", type = "info",   name = "Comments",                              page = "qa-com-ce",       data = qa_com_ce)
+  list(group = "Creel event", type = "info",   name = "Comments",                              page = "qa-com-ce",       data = qa_com_ce),
+  list(group = "Interview",   type = "review", name = "Late Night Times", page = "qa-int-late", data = qa_int_late),
+  list(group = "Effort",      type = "review", name = "Late Night Times", page = "qa-eff-late", data = qa_eff_late),
+  list(group = "Creel event", type = "review", name = "Late Night Times", page = "qa-ce-late",  data = qa_ce_late)
 )
 
 qa_summary <- reactive({
@@ -1206,6 +1258,9 @@ tags$style(HTML("
 .dataTables_wrapper .page-link { background:#3b3b3b; color:#fff; border-color:#888; }
 .dataTables_wrapper .page-item.active .page-link { background:#375a7f; border-color:#fff; }
 .chart-stage { overflow-y: auto !important; }
+.navbar .navbar-nav { flex-wrap: wrap; }
+.navbar .nav-link { padding-left: .5rem; padding-right: .5rem; font-size: 14px; }
+.navbar .dropdown-menu { max-height: 80vh; overflow-y: auto; }
 "))
 
 tags$script(HTML("
@@ -1443,163 +1498,308 @@ uiOutput("cvp_controls")
 uiOutput("cvp_container")
 ```
 
-# UM Chin Kept {#qa-um-chin data-navmenu="Catch QA_QC"}
+# UM Chin Kept {#qa-um-chin data-navmenu="Catch"}
 
 ```{r um-chin-kept, echo=FALSE}
 renderDT(dt_dark(qa_um_chin()))
 ```
 
-# All CWT + (Beep) {#qa-cwt-beep data-navmenu="Catch QA_QC"}
+# All CWT + (Beep) {#qa-cwt-beep data-navmenu="Catch"}
 
 ```{r cwt-beep, echo=FALSE}
 renderDT(dt_dark(qa_cwt_beep()))
 ```
 
-# CWT + (Beep) NA Snout Code {#qa-cwt-na-snout data-navmenu="Catch QA_QC"}
+# CWT + (Beep) NA Snout Code {#qa-cwt-na-snout data-navmenu="Catch"}
 
 ```{r cwt-na-snout, echo=FALSE}
 renderDT(dt_dark(qa_cwt_na_snout()))
 ```
 
-# CWT no (Beep) with Snout Code {#qa-cwt-no-beep data-navmenu="Catch QA_QC"}
+# CWT no (Beep) with Snout Code {#qa-cwt-no-beep data-navmenu="Catch"}
 
 ```{r cwt-no-beep, echo=FALSE}
 renderDT(dt_dark(qa_cwt_no_beep()))
 ```
 
-# Released fish with Bio. samples {#qa-rel-bio data-navmenu="Catch QA_QC"}
+# Released fish with Bio. samples {#qa-rel-bio data-navmenu="Catch"}
 
 ```{r released-bio, echo=FALSE}
 renderDT(dt_dark(qa_rel_bio()))
 ```
 
-# Catch > 10 {#qa-catch-gt10 data-navmenu="Catch QA_QC"}
+# Catch > 10 {#qa-catch-gt10 data-navmenu="Catch"}
 
 ```{r catch-gt10, echo=FALSE}
 renderDT(dt_dark(qa_catch_gt10()))
 ```
 
-# Scale Card Errors {#qa-scale-card data-navmenu="Catch QA_QC"}
+# Scale Card Errors {#qa-scale-card data-navmenu="Catch"}
 
 ```{r scale-card, echo=FALSE}
 renderDT(dt_dark(qa_scale_card(), sort = FALSE))
 ```
 
-# Photos {#qa-photos data-navmenu="Catch QA_QC"}
+# Photos {#qa-photos data-navmenu="Catch"}
 
 ```{r photos, echo=FALSE}
 renderDT(dt_dark(qa_photos()))
 ```
 
-# Catch Comments {#qa-com-catch data-navmenu="Catch QA_QC"}
+# Catch Comments {#qa-com-catch data-navmenu="Catch"}
 
 ```{r catch-comments, echo=FALSE}
 renderDT(dt_dark(qa_com_catch()))
 ```
 
-# Incomplete Trip Status with Fishing End Time {#qa-int-1 data-navmenu="Interviews QA_QC"}
+# Incomplete Trip Status with Fishing End Time {#qa-int-1 data-navmenu="Interview"}
 
 ```{r interview-qc1, echo=FALSE}
 renderDT(dt_dark(qa_int_1()))
 ```
 
-# Missing Trip Status {#qa-int-2 data-navmenu="Interviews QA_QC"}
+# Missing Trip Status {#qa-int-2 data-navmenu="Interview"}
 
 ```{r interview-qc2, echo=FALSE}
 renderDT(dt_dark(qa_int_2()))
 ```
 
-# Fishing End Time > Interview Time {#qa-int-3 data-navmenu="Interviews QA_QC"}
+# Fishing End Time > Interview Time {#qa-int-3 data-navmenu="Interview"}
 
 ```{r interview-qc3, echo=FALSE}
 renderDT(dt_dark(qa_int_3()))
 ```
 
-# Fishing Start Time > Fishing End Time {#qa-int-4 data-navmenu="Interviews QA_QC"}
+# Fishing Start Time > Fishing End Time {#qa-int-4 data-navmenu="Interview"}
 
 ```{r interview-qc4, echo=FALSE}
 renderDT(dt_dark(qa_int_4()))
 ```
 
-# Trailer Count > Vehicle Count {#qa-int-5 data-navmenu="Interviews QA_QC"}
+# Trailer Count > Vehicle Count {#qa-int-5 data-navmenu="Interview"}
 
 ```{r interview-qc5, echo=FALSE}
 renderDT(dt_dark(qa_int_5()))
 ```
 
-# Angler Count > Group Count {#qa-int-6 data-navmenu="Interviews QA_QC"}
+# Angler Count > Group Count {#qa-int-6 data-navmenu="Interview"}
 
 ```{r interview-qc6, echo=FALSE}
 renderDT(dt_dark(qa_int_6()))
 ```
 
-# Vehicle Count > Group Count {#qa-int-7 data-navmenu="Interviews QA_QC"}
+# Vehicle Count > Group Count {#qa-int-7 data-navmenu="Interview"}
 
 ```{r interview-qc7, echo=FALSE}
 renderDT(dt_dark(qa_int_7()))
 ```
 
-# NA Previously Interviewed {#qa-int-8 data-navmenu="Interviews QA_QC"}
+# NA Previously Interviewed {#qa-int-8 data-navmenu="Interview"}
 
 ```{r interview-qc8, echo=FALSE}
 renderDT(dt_dark(qa_int_8()))
 ```
 
-# NA Fishing Location {#qa-int-9 data-navmenu="Interviews QA_QC"}
+# NA Fishing Location {#qa-int-9 data-navmenu="Interview"}
 
 ```{r interview-qc9, echo=FALSE}
 renderDT(dt_dark(qa_int_9()))
 ```
 
-# Start Time = Interview/ End Time {#qa-int-start-eq data-navmenu="Interviews QA_QC"}
+# Start Time = Interview/ End Time {#qa-int-start-eq data-navmenu="Interview"}
 
 ```{r interview-start-eq, echo=FALSE}
 renderDT(dt_dark(qa_int_start_eq()))
 ```
 
-# Fishing End / Interview < 30 Min After Start {#qa-int-short data-navmenu="Interviews QA_QC"}
+# Fishing End / Interview < 30 Min After Start {#qa-int-short data-navmenu="Interview"}
 
 ```{r interview-time-short, echo=FALSE}
 renderDT(dt_dark(qa_int_short()))
 ```
 
-# Fishing Time > 12 Hrs {#qa-int-long data-navmenu="Interviews QA_QC"}
+# Fishing Time > 12 Hrs {#qa-int-long data-navmenu="Interview"}
 
 ```{r interview-time-long, echo=FALSE}
 renderDT(dt_dark(qa_int_long()))
 ```
 
-# Interview Comments {#qa-com-int data-navmenu="Interviews QA_QC"}
+# Interview Comments {#qa-com-int data-navmenu="Interview"}
 
 ```{r interview-comments, echo=FALSE}
 renderDT(dt_dark(qa_com_int()))
 ```
 
-# Effort Count Sequence Check {#qa-eff-1 data-navmenu="Effort Count QA_QC"}
+# Late Night Times {#qa-int-late data-navmenu="Interview"}
+
+```{r interview-late, echo=FALSE}
+renderDT(dt_dark(qa_int_late()))
+```
+
+# Effort Count Sequence Check {#qa-eff-1 data-navmenu="Effort Count"}
 
 ```{r effort-qc1, echo=FALSE}
 renderDT(dt_dark(qa_eff_1()))
 ```
 
-# Effort Start Time > End Time {#qa-eff-2 data-navmenu="Effort Count QA_QC"}
+# Effort Start Time > End Time {#qa-eff-2 data-navmenu="Effort Count"}
 
 ```{r effort-qc2, echo=FALSE}
 renderDT(dt_dark(qa_eff_2()))
 ```
 
-# Vehicles >15 {#qa-eff-veh15 data-navmenu="Effort Count QA_QC"}
+# Vehicles >15 {#qa-eff-veh15 data-navmenu="Effort Count"}
 
 ```{r effort-veh15, echo=FALSE}
 renderDT(dt_dark(qa_eff_veh15()))
 ```
 
-# More Trailers Than Vehicles {#qa-eff-trl data-navmenu="Effort Count QA_QC"}
+# More Trailers Than Vehicles {#qa-eff-trl data-navmenu="Effort Count"}
 
 ```{r effort-trailers, echo=FALSE}
 renderDT(dt_dark(qa_eff_trl()))
 ```
 
-# Effort Comments {#qa-com-eff data-navmenu="Effort Count QA_QC"}
+# Effort Comments {#qa-com-eff data-navmenu="Effort Count"}
 
 ```{r effort-comments, echo=FALSE}
 renderDT(dt_dark(qa_com_eff()))
+```
+
+# Late Night Times {#qa-eff-late data-navmenu="Effort Count"}
+
+```{r effort-late, echo=FALSE}
+renderDT(dt_dark(qa_eff_late()))
+```
+
+# Late Night Times {#qa-ce-late data-navmenu="Creel Event"}
+
+```{r creel-event-late, echo=FALSE}
+renderDT(dt_dark(qa_ce_late()))
+```
+
+# Needs Proof Stamp {#qa-ce-proof data-navmenu="Creel Event"}
+
+```{r proof-stamp, echo=FALSE}
+renderDT(dt_dark(qa_ce_proof()))
+```
+
+# NA Survey End Time {#qa-ce-end data-navmenu="Creel Event"}
+
+```{r na-survey-end, echo=FALSE}
+renderDT(dt_dark(qa_ce_end()))
+```
+
+# Creel Event Comments {#qa-com-ce data-navmenu="Creel Event"}
+
+```{r creel-event-comments, echo=FALSE}
+renderDT(dt_dark(qa_com_ce()))
+```
+
+# Catch Table {data-navmenu="Summary"}
+
+```{r catch-summary, echo=FALSE}
+catch_group_table <- function(df, fn) {
+  d <- df %>%
+    filter(fishery_name == fn) %>%
+    mutate(
+      across(c(species, life_stage, fin_mark, fate), ~na_if(as.character(.x), "")),
+      across(c(species, life_stage, fin_mark, fate), ~replace_na(.x, "Not recorded")),
+      cwt_detection_status = replace_na(na_if(as.character(cwt_detection_status), ""),
+                                        "Not recorded")
+    )
+
+  cwt <- d %>%
+    group_by(species, life_stage, fin_mark, fate, cwt_detection_status) %>%
+    summarise(fish = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
+    mutate(catch_group = paste(species, life_stage, fin_mark, fate, sep = "_"))
+
+  grp <- cwt %>%
+    group_by(catch_group) %>%
+    summarise(
+      total_fish   = sum(fish),
+      n_cwt_status = n(),
+      cwt_status   = if (n() == 1) first(cwt_detection_status)
+                     else paste0(n(), " statuses (click row to expand)"),
+      .groups = "drop"
+    ) %>%
+    arrange(catch_group)
+
+  reactable(
+    grp,
+    filterable = TRUE,
+    outlined = TRUE, highlight = TRUE, resizable = TRUE,
+    defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+    columns = list(
+      catch_group  = colDef(name = "Catch groups", minWidth = 220),
+      total_fish   = colDef(name = "Total fish", format = colFormat(separators = TRUE)),
+      cwt_status   = colDef(name = "CWT detection status"),
+      n_cwt_status = colDef(show = FALSE)
+    ),
+    details = function(index) {
+      if (grp$n_cwt_status[index] < 2) return(NULL)
+      sub <- cwt %>%
+        filter(catch_group == grp$catch_group[index]) %>%
+        select(`CWT detection status` = cwt_detection_status, Fish = fish) %>%
+        arrange(desc(Fish))
+      div(style = "padding: 8px 24px;",
+          reactable(sub, defaultPageSize = 50, outlined = TRUE, compact = TRUE,
+                    theme = dark_reactable_theme))
+    },
+    theme = dark_reactable_theme
+  )
+}
+
+renderUI(selectInput("catch_tbl_fishery", "Fishery:", choices = req(sel_fisheries())))
+renderReactable(catch_group_table(wdfw_catch(), req(input$catch_tbl_fishery)))
+```
+
+# Effort Table {data-navmenu="Summary"}
+
+```{r effort-summary, echo=FALSE}
+renderReactable({
+  wdfw_effort_count() %>%
+    group_by(fishery_name, water_body, location, survey_type, count_type) %>%
+    summarise(
+      total_vehicles_trailers_from_effort_counts = sum(count_quantity, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    reactable(
+      filterable = TRUE,
+      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+      groupBy = c("fishery_name", "survey_type", "water_body", "location"),
+      columns = list(
+        total_vehicles_trailers_from_effort_counts = colDef(
+          aggregate = "sum", format = colFormat(separators = TRUE)
+        )
+      ),
+      outlined = TRUE, highlight = TRUE, resizable = TRUE,
+      theme = dark_reactable_theme
+    )
+})
+```
+
+# Interview Table {data-navmenu="Summary"}
+
+```{r interview-summary, echo=FALSE}
+renderReactable({
+  wdfw_interview() %>%
+    group_by(fishery_name, water_body, fishing_location, boat_used, boat_type) %>%
+    summarise(
+      total_angler_count_from_interviews = sum(angler_count, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    reactable(
+      filterable = TRUE,
+      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+      groupBy = c("fishery_name", "survey_type", "water_body", "fishing_location", "boat_used")[c(1,3,4,5)],
+      columns = list(
+        total_angler_count_from_interviews = colDef(
+          aggregate = "sum", format = colFormat(separators = TRUE)
+        )
+      ),
+      outlined = TRUE, highlight = TRUE, resizable = TRUE,
+      theme = dark_reactable_theme
+    )
+})
+```
