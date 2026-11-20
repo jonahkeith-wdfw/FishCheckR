@@ -28,6 +28,7 @@ library(hms)
 library(DT)
 library(reactable)
 library(plotly)
+library(leaflet)
 library(creelutils)
 
 # Hyperlinks. Built from pieces so copy/paste can't turn it into a markdown link
@@ -329,7 +330,7 @@ catch_cols <- c(
   "snout_code", "cwt_read_status", "cwt_code", "cwt_species", "cwt_run",
   "scale_card_num", "scale_card_pos", "scale_age_code",
   "pit_detection_status", "comments", "image_url",
-  "creel_event_id", "interview_id", "catch_id"
+  "created_datetime", "creel_event_id", "interview_id", "catch_id"
 )
 
 wrangle_catch <- function(df) {
@@ -359,10 +360,12 @@ wrangle_creel_event <- function(df) {
   }
   df %>%
     ensure_cols(c("event_date", "water_body", "project_name", "start_time", "end_time",
-                  "tie_in_indicator", "qaqc_datetime", "creel_event_id")) %>%
+                  "tie_in_indicator", "qaqc_datetime", "creel_event_id", "observer_name",
+                  "created_datetime", "created_latitude", "created_longitude")) %>%
     select(
       event_date, water_body, project_name, start_time, end_time,
-      tie_in_indicator, comment_txt, qaqc_datetime, creel_event_id
+      tie_in_indicator, comment_txt, qaqc_datetime, creel_event_id, observer_name,
+      created_datetime, created_latitude, created_longitude
     ) %>%
     mutate(tie_in_indicator = as.numeric(as_flag(tie_in_indicator)),
            creel_event_id   = as.character(creel_event_id)) %>%
@@ -374,7 +377,7 @@ interview_cols <- c(
   "section_num", "survey_type", "surveyor_num", "interview_number", "trip_status",
   "previously_interviewed", "angler_count", "total_group_count", "vehicle_count",
   "trailer_count", "boat_type", "boat_used", "fishing_start_time", "fishing_end_time",
-  "interview_time", "comment_txt", "creel_event_id", "interview_id", "location_id"
+  "interview_time", "created_datetime", "comment_txt", "creel_event_id", "interview_id", "location_id"
 )
 
 wrangle_interview <- function(df) {
@@ -390,7 +393,7 @@ wrangle_interview <- function(df) {
 effort_cols <- c(
   "event_date", "project_name", "fishery_name", "water_body", "location",
   "tie_in_indicator", "survey_type", "count_sequence", "section_num",
-  "effort_start_time", "effort_end_time", "count_quantity", "count_type",
+  "effort_start_time", "effort_end_time", "created_datetime", "count_quantity", "count_type",
   "location_type", "surveyor_num", "comments", "p_census_boat", "p_census_bank",
   "indirect_census_bank", "no_count_reason", "creel_event_id", "effort_event_id",
   "location_id"
@@ -501,6 +504,117 @@ wdfw_catch        <- reactive(dat()$catch)
 wdfw_interview    <- reactive(dat()$interview)
 wdfw_effort_count <- reactive(dat()$effort)
 wdfw_creel_event  <- reactive(dat()$creel_event)
+
+fetch_internal_ids <- function(table_name, id_column, values, chunk_size = 1000L) {
+  values <- unique(as.character(values))
+  values <- values[!is.na(values) & nzchar(values)]
+  if (!length(values)) return(tibble())
+
+  split(values, ceiling(seq_along(values) / chunk_size)) %>%
+    map(~fetch_db_table(get_con(), "creel", table_name,
+                        filter = q_in(id_column, .x))) %>%
+    bind_rows()
+}
+
+waypoint_records <- reactive({
+  if (!identical(sel_source(), "internal")) return(tibble())
+
+  interview_location_rows <- fetch_internal_ids(
+    "interview", "interview_id", wdfw_interview()$interview_id
+  )
+  effort_event_rows <- fetch_internal_ids(
+    "effort_event", "effort_event_id", wdfw_effort_count()$effort_event_id
+  )
+  location_ids <- unique(c(
+    as.character(interview_location_rows$record_location_id),
+    as.character(effort_event_rows$record_location_id)
+  ))
+  record_location_rows <- fetch_internal_ids("record_location_lut", "record_location_id", location_ids)
+
+  location_lookup <- record_location_rows %>%
+    transmute(record_location_id = as.character(record_location_id),
+              latitude = as.numeric(lat), longitude = as.numeric(lon))
+
+  interview_coordinates <- interview_location_rows %>%
+    transmute(interview_id = as.character(interview_id),
+              record_location_id = as.character(record_location_id)) %>%
+    left_join(location_lookup, by = "record_location_id") %>%
+    distinct(interview_id, .keep_all = TRUE) %>%
+    select(interview_id, latitude, longitude)
+
+  effort_coordinates <- effort_event_rows %>%
+    transmute(effort_event_id = as.character(effort_event_id),
+              record_location_id = as.character(record_location_id)) %>%
+    left_join(location_lookup, by = "record_location_id") %>%
+    distinct(effort_event_id, .keep_all = TRUE) %>%
+    select(effort_event_id, latitude, longitude)
+
+  event_lookup <- wdfw_creel_event() %>%
+    transmute(creel_event_id = as.character(creel_event_id),
+              surveyor_name = coalesce(trimws(as.character(observer_name)), "Unknown surveyor"))
+
+  local_view_time <- function(x) {
+    lubridate::force_tz(suppressWarnings(as.POSIXct(x)),
+                        tzone = "America/Los_Angeles")
+  }
+
+  event_points <- wdfw_creel_event() %>%
+    transmute(
+      record_type = "Survey event",
+      surveyor_name = coalesce(trimws(as.character(observer_name)), "Unknown surveyor"),
+      creel_event_id = as.character(creel_event_id),
+      record_id = as.character(creel_event_id),
+      latitude = as.numeric(created_latitude),
+      longitude = as.numeric(created_longitude),
+      waypoint_timestamp = local_view_time(created_datetime)
+    )
+
+  interview_points <- wdfw_interview() %>%
+    mutate(interview_id = as.character(interview_id),
+           creel_event_id = as.character(creel_event_id)) %>%
+    left_join(interview_coordinates, by = "interview_id") %>%
+    left_join(event_lookup, by = "creel_event_id") %>%
+    transmute(
+      record_type = "Interview",
+      surveyor_name = coalesce(surveyor_name, "Unknown surveyor"),
+      creel_event_id, record_id = interview_id,
+      latitude, longitude,
+      waypoint_timestamp = local_view_time(created_datetime)
+    )
+
+  effort_points <- wdfw_effort_count() %>%
+    mutate(effort_event_id = as.character(effort_event_id),
+           creel_event_id = as.character(creel_event_id)) %>%
+    distinct(effort_event_id, .keep_all = TRUE) %>%
+    left_join(effort_coordinates, by = "effort_event_id") %>%
+    left_join(event_lookup, by = "creel_event_id") %>%
+    transmute(
+      record_type = "Effort",
+      surveyor_name = coalesce(surveyor_name, "Unknown surveyor"),
+      creel_event_id, record_id = effort_event_id,
+      latitude, longitude,
+      waypoint_timestamp = local_view_time(created_datetime)
+    )
+
+  catch_points <- wdfw_catch() %>%
+    mutate(catch_id = as.character(catch_id),
+           interview_id = as.character(interview_id),
+           creel_event_id = as.character(creel_event_id)) %>%
+    distinct(catch_id, .keep_all = TRUE) %>%
+    left_join(interview_coordinates, by = "interview_id") %>%
+    left_join(event_lookup, by = "creel_event_id") %>%
+    transmute(
+      record_type = "Catch",
+      surveyor_name = coalesce(surveyor_name, "Unknown surveyor"),
+      creel_event_id, record_id = catch_id,
+      latitude, longitude,
+      waypoint_timestamp = local_view_time(created_datetime)
+    )
+
+  bind_rows(event_points, interview_points, effort_points, catch_points) %>%
+    filter(is.finite(latitude), is.finite(longitude),
+           between(latitude, -90, 90), between(longitude, -180, 180))
+})
 
 prev_map <- reactive({
   tibble(fishery_name = req(sel_fisheries())) %>%
@@ -953,6 +1067,135 @@ qa_com_ce <- reactive({
            comment_txt, creel_event_id)
 })
 
+# Compare child-record times with the creation timestamps in the internal analysis views.
+empty_timestamp_results <- function(record_id, time_column) {
+  out <- tibble(
+    surveyor_name = character(),
+    surveyor_issue_count = integer(),
+    mismatch_text = character(),
+    event_date = as.Date(character()),
+    entered_time = character(),
+    created_timestamp = as.POSIXct(character(), tz = "UTC"),
+    time_diff_min = double(),
+    created_latitude = double(),
+    created_longitude = double(),
+    creel_event_id = character(),
+    record_key = character()
+  )
+  names(out)[names(out) == "entered_time"] <- time_column
+  names(out)[names(out) == "record_key"] <- record_id
+  out
+}
+
+timestamp_mismatch_rows <- function(records, record_id, time_column, time_label,
+                                    deduplicate_by = NULL) {
+  if (!identical(sel_source(), "internal") || !nrow(records)) {
+    return(empty_timestamp_results(record_id, time_column))
+  }
+
+  event_lookup <- wdfw_creel_event() %>%
+    transmute(
+      creel_event_id = as.character(creel_event_id),
+      surveyor_name = coalesce(trimws(as.character(observer_name)), "Unknown surveyor")
+    )
+
+  d <- records %>%
+    mutate(form_id = as.character(.data[[record_id]]),
+           creel_event_id = as.character(creel_event_id),
+           created_timestamp = lubridate::force_tz(
+             as.POSIXct(created_datetime), tzone = "America/Los_Angeles")) %>%
+    left_join(event_lookup, by = "creel_event_id") %>%
+    mutate(
+      surveyor_name = coalesce(surveyor_name, "Unknown surveyor")
+    ) %>%
+    mutate(
+      entered_datetime = suppressWarnings(ymd_hms(
+        paste(event_date, as.character(.data[[time_column]])),
+        tz = "America/Los_Angeles"
+      )),
+      date_mismatch = as.Date(event_date) != as.Date(
+        created_timestamp, tz = "America/Los_Angeles"
+      ),
+      time_diff_min = round(abs(as.numeric(
+        entered_datetime - created_timestamp, units = "mins"
+      )), 1),
+      time_mismatch = !is.na(time_diff_min) & time_diff_min > 60,
+      mismatch_text = paste0(
+        if_else(date_mismatch, "Entered date does not match created timestamp date; ", ""),
+        if_else(time_mismatch,
+                paste0(time_label, " differs from created timestamp by >60 min; "), "")
+      )
+    ) %>%
+    filter(date_mismatch | time_mismatch) %>%
+    mutate(mismatch_text = sub("; $", "", mismatch_text))
+
+  if (!nrow(d)) return(empty_timestamp_results(record_id, time_column))
+
+  if (!is.null(deduplicate_by)) {
+    d <- d %>% distinct(across(all_of(deduplicate_by)), .keep_all = TRUE)
+  }
+
+  d %>%
+    group_by(surveyor_name) %>%
+    mutate(surveyor_issue_count = n()) %>%
+    ungroup() %>%
+    arrange(surveyor_name, desc(event_date), desc(created_timestamp)) %>%
+    select(surveyor_name, surveyor_issue_count, mismatch_text,
+           event_date, all_of(time_column), created_timestamp, time_diff_min,
+           creel_event_id, all_of(record_id))
+}
+
+qa_int_timestamp_mismatch <- reactive({
+  timestamp_mismatch_rows(wdfw_interview(), "interview_id", "interview_time",
+                          "Interview time")
+})
+
+qa_eff_timestamp_mismatch <- reactive({
+  timestamp_mismatch_rows(wdfw_effort_count(), "effort_event_id", "effort_start_time",
+                          "Effort start time",
+                          deduplicate_by = "effort_event_id")
+})
+
+# Compare entered survey date and start time with the event view creation timestamp.
+qa_timestamp_date_mismatch <- reactive({
+  if (!identical(sel_source(), "internal")) {
+    return(empty_timestamp_results("creel_event_id", "start_time"))
+  }
+  d <- wdfw_creel_event() %>%
+    mutate(
+      creel_event_id = as.character(creel_event_id),
+      surveyor_name = coalesce(trimws(as.character(observer_name)), "Unknown surveyor"),
+      created_timestamp = lubridate::force_tz(
+        as.POSIXct(created_datetime), tzone = "America/Los_Angeles")
+    ) %>%
+    mutate(
+      entered_start = suppressWarnings(ymd_hms(paste(event_date,
+                         format(start_time, "%H:%M:%S")),
+                       tz = "America/Los_Angeles")),
+      date_mismatch = as.Date(event_date) != as.Date(created_timestamp,
+                      tz = "America/Los_Angeles"),
+      start_diff_min = round(abs(as.numeric(entered_start - created_timestamp, units = "mins")), 1),
+      start_time_mismatch = !is.na(start_diff_min) & start_diff_min > 60,
+      mismatch_text = paste0(
+        if_else(date_mismatch, "Entered date does not match created timestamp date; ", ""),
+        if_else(start_time_mismatch, "Start time differs from created timestamp by >60 min; ", "")
+      )
+    ) %>%
+    filter(date_mismatch | start_time_mismatch) %>%
+    mutate(mismatch_text = sub("; $", "", mismatch_text))
+
+  if (!nrow(d)) return(tibble())
+
+  d %>%
+    group_by(surveyor_name) %>%
+    mutate(surveyor_issue_count = n()) %>%
+    ungroup() %>%
+    arrange(surveyor_name, desc(event_date), desc(created_timestamp)) %>%
+    select(surveyor_name, surveyor_issue_count, mismatch_text,
+       event_date, start_time, end_time, created_timestamp,
+       start_diff_min, created_latitude, created_longitude, creel_event_id)
+})
+
 # ---- Late Night Times (review, red/green): 22:00 through 04:00, inclusive ----
 is_late_night <- function(x) {
   s <- as.numeric(x)
@@ -1022,9 +1265,12 @@ qa_checks <- list(
   list(group = "Interview",   type = "info",   name = "Fishing end / interview < 30 min after start", page = "qa-int-short", data = qa_int_short),
   list(group = "Interview",   type = "info",   name = "Fishing time > 12 hrs",                 page = "qa-int-long",     data = qa_int_long),
   list(group = "Interview",   type = "info",   name = "Comments",                              page = "qa-com-int",      data = qa_com_int),
+  list(group = "Interview",   type = "info",   name = "Timestamp date mismatch",               page = "qa-int-timestamp-mismatch", data = qa_int_timestamp_mismatch),
   list(group = "Effort",      type = "info",   name = "Vehicles >15",                          page = "qa-eff-veh15",    data = qa_eff_veh15),
   list(group = "Effort",      type = "info",   name = "Comments",                              page = "qa-com-eff",      data = qa_com_eff),
+  list(group = "Effort",      type = "info",   name = "Timestamp date mismatch",               page = "qa-eff-timestamp-mismatch", data = qa_eff_timestamp_mismatch),
   list(group = "Creel event", type = "info",   name = "Comments",                              page = "qa-com-ce",       data = qa_com_ce),
+  list(group = "Creel event", type = "info",   name = "Timestamp date mismatch",               page = "qa-timestamp-date-mismatch", data = qa_timestamp_date_mismatch),
   list(group = "Interview",   type = "review", name = "Late Night Times", page = "qa-int-late", data = qa_int_late),
   list(group = "Effort",      type = "review", name = "Late Night Times", page = "qa-eff-late", data = qa_eff_late),
   list(group = "Creel event", type = "review", name = "Late Night Times", page = "qa-ce-late",  data = qa_ce_late)
@@ -1346,6 +1592,139 @@ renderReactable({
 })
 ```
 
+# Waypoints {data-icon="fa-map"}
+
+```{r waypoints-page, echo=FALSE}
+output$waypoints_ui <- renderUI({
+  if (!identical(sel_source(), "internal")) {
+    return(tags$p("Waypoints are available only after loading data from the internal database."))
+  }
+  if (is.null(sel_fisheries())) return(tags$p("Select an internal fishery and click Load data."))
+
+  points <- waypoint_records()
+  surveyors <- sort(unique(points$surveyor_name))
+  record_types <- c("Survey event", "Interview", "Effort", "Catch")
+
+  tagList(
+    fluidRow(
+      column(
+        5,
+        div(
+          class = "waypoint-surveyors",
+          selectizeInput(
+            "waypoint_surveyors", "Surveyors", choices = surveyors,
+            selected = surveyors, multiple = TRUE,
+            options = list(plugins = list("remove_button"))
+          )
+        )
+      ),
+      column(
+        7,
+        checkboxGroupInput(
+          "waypoint_types", "Waypoint records",
+          choices = record_types, selected = record_types, inline = TRUE
+        )
+      )
+    ),
+    tags$style(HTML(".waypoint-surveyors .selectize-input { max-height: 92px; overflow-y: auto; }")),
+    leafletOutput("waypoints_map", height = "calc(100vh - 245px)")
+  )
+})
+
+output$waypoints_map <- renderLeaflet({
+  validate(shiny::need(identical(sel_source(), "internal"),
+                       "Waypoints require the internal database."))
+  req(sel_fisheries())
+
+  points <- waypoint_records()
+  map <- leaflet() %>%
+    addProviderTiles(providers$OpenStreetMap.Mapnik, group = "OpenStreetMap") %>%
+    addProviderTiles(providers$OpenTopoMap, group = "Topographic") %>%
+    addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
+    addTiles(
+      "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}",
+      group = "Roads",
+      attribution = "Tiles &copy; Esri",
+      options = tileOptions(opacity = 0.9)
+    )
+
+  if (!nrow(points)) {
+    return(map %>%
+      setView(lng = -120.7, lat = 47.4, zoom = 6) %>%
+      addControl("No waypoint coordinates for the loaded fishery.", position = "topright"))
+  }
+
+  selected_surveyors <- input$waypoint_surveyors
+  if (is.null(selected_surveyors)) selected_surveyors <- unique(points$surveyor_name)
+  selected_types <- input$waypoint_types
+  if (is.null(selected_types)) selected_types <- c("Survey event", "Interview", "Effort", "Catch")
+
+  points <- points %>%
+    filter(surveyor_name %in% selected_surveyors, record_type %in% selected_types)
+
+  if (!nrow(points)) {
+    return(map %>%
+      setView(lng = -120.7, lat = 47.4, zoom = 6) %>%
+      addControl("No waypoints match these filters.", position = "topright"))
+  }
+
+  colors <- c("Survey event" = "#f4d35e", "Interview" = "#39c6c8",
+              "Effort" = "#f28e2b", "Catch" = "#e85d75")
+  type_order <- c("Survey event", "Interview", "Effort", "Catch")
+  points <- points %>%
+    mutate(
+      marker_color = unname(colors[record_type]),
+      timestamp_date = if_else(
+        is.na(waypoint_timestamp), "Unknown date",
+        format(waypoint_timestamp, "%Y-%m-%d", tz = "America/Los_Angeles")
+      ),
+      timestamp_label = if_else(
+        is.na(waypoint_timestamp), "Unknown",
+        format(waypoint_timestamp, "%Y-%m-%d %H:%M:%S %Z", tz = "America/Los_Angeles")
+      ),
+      popup_html = paste0(
+        "<strong>", htmltools::htmlEscape(record_type), "</strong><br>",
+        "Surveyor: ", htmltools::htmlEscape(surveyor_name), "<br>",
+        "Created: ", htmltools::htmlEscape(timestamp_label), "<br>",
+        "Coordinates: ", round(latitude, 6), ", ", round(longitude, 6), "<br>",
+        if_else(!is.na(creel_event_id),
+                paste0('<a href="', CREEL_EVENT_URL, creel_event_id,
+                       '" target="_blank" rel="noopener noreferrer">Open survey event</a>'), "")
+      )
+    )
+
+  map <- map %>% addCircleMarkers(
+    data = points, lng = ~longitude, lat = ~latitude,
+    radius = 4, color = "#111111", fillColor = ~marker_color,
+    fillOpacity = 1, weight = 0.8, popup = ~popup_html,
+    label = ~paste(surveyor_name, timestamp_label, sep = " - ")
+  )
+
+  map <- map %>%
+    addLayersControl(
+      baseGroups = c("OpenStreetMap", "Topographic", "Satellite"),
+      overlayGroups = "Roads",
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    addLegend(
+      position = "bottomright", colors = colors[type_order[type_order %in% unique(points$record_type)]],
+      labels = type_order[type_order %in% unique(points$record_type)],
+      title = "Waypoint type", opacity = 1
+    )
+
+  if (n_distinct(points$latitude, points$longitude) == 1) {
+    map %>% setView(lng = points$longitude[[1]], lat = points$latitude[[1]], zoom = 14)
+  } else {
+    map %>% fitBounds(
+      lng1 = min(points$longitude), lat1 = min(points$latitude),
+      lng2 = max(points$longitude), lat2 = max(points$latitude)
+    )
+  }
+})
+
+uiOutput("waypoints_ui")
+```
+
 # Catch Last 30 Days {data-navmenu="Raw Catch Plots"}
 
 ```{r last-30-days, echo=FALSE}
@@ -1543,7 +1922,18 @@ renderDT(dt_dark(qa_scale_card(), sort = FALSE))
 # Photos {#qa-photos data-navmenu="Catch"}
 
 ```{r photos, echo=FALSE}
-renderDT(dt_dark(qa_photos()))
+output$photos_ui <- renderUI({
+  if (!identical(sel_source(), "internal")) {
+    return(tags$p("Photos are available only after loading data from the internal database."))
+  }
+  if (is.null(sel_fisheries())) {
+    return(tags$p("Select an internal fishery and click Load data."))
+  }
+  DTOutput("photos_table")
+})
+
+output$photos_table <- renderDT(dt_dark(qa_photos()))
+uiOutput("photos_ui")
 ```
 
 # Catch Comments {#qa-com-catch data-navmenu="Catch"}
@@ -1630,6 +2020,12 @@ renderDT(dt_dark(qa_int_long()))
 renderDT(dt_dark(qa_com_int()))
 ```
 
+# Interview Timestamp Date Mismatch {#qa-int-timestamp-mismatch data-navmenu="Interview"}
+
+```{r interview-timestamp-mismatch, echo=FALSE}
+renderDT(dt_dark(qa_int_timestamp_mismatch(), sort = FALSE))
+```
+
 # Late Night Times {#qa-int-late data-navmenu="Interview"}
 
 ```{r interview-late, echo=FALSE}
@@ -1666,6 +2062,12 @@ renderDT(dt_dark(qa_eff_trl()))
 renderDT(dt_dark(qa_com_eff()))
 ```
 
+# Effort Timestamp Date Mismatch {#qa-eff-timestamp-mismatch data-navmenu="Effort Count"}
+
+```{r effort-timestamp-mismatch, echo=FALSE}
+renderDT(dt_dark(qa_eff_timestamp_mismatch(), sort = FALSE))
+```
+
 # Late Night Times {#qa-eff-late data-navmenu="Effort Count"}
 
 ```{r effort-late, echo=FALSE}
@@ -1694,6 +2096,12 @@ renderDT(dt_dark(qa_ce_end()))
 
 ```{r creel-event-comments, echo=FALSE}
 renderDT(dt_dark(qa_com_ce()))
+```
+
+# Timestamp Date Mismatch {#qa-timestamp-date-mismatch data-navmenu="Creel Event"}
+
+```{r creel-event-timestamp-mismatch, echo=FALSE}
+renderDT(dt_dark(qa_timestamp_date_mismatch(), sort = FALSE))
 ```
 
 # Catch Table {data-navmenu="Summary"}
